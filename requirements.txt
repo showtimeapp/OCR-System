@@ -1,13 +1,13 @@
 torch
 torchvision
-vllm
 fastapi
 uvicorn
 python-multipart
-aiohttp
-aiofiles
+python-dotenv
 ultralytics
 pdf2image
 Pillow
 pdfplumber
 huggingface_hub
+aiofiles
+aiohttp

@@ -1,9 +1,9 @@
 """
-FastAPI Server — PDF Extraction API
-Input: Upload PDF → Output: JSON + Markdown
+FastAPI — PDF Extraction API
+Upload PDF → Get JSON + Markdown
 """
 
-import os, json, shutil, asyncio, logging
+import os, json, shutil, logging
 from pathlib import Path
 from datetime import datetime
 from uuid import uuid4
@@ -12,7 +12,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from pipeline import process_pdf
+from pipeline import process_pdf, Models
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('api')
@@ -22,30 +22,27 @@ app = FastAPI(
     description="Upload PDF → Get structured JSON + Markdown with chart descriptions",
     version="1.0.0",
 )
-
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-UPLOAD_DIR = Path("/opt/pipeline/uploads")
-RESULTS_DIR = Path("/opt/pipeline/results")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
+RESULTS_DIR = Path(os.getenv("RESULTS_DIR", "./results"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Track job status
 jobs = {}
 
 
-# ═══════════════════════════════════════════════════
-#  Health check
-# ═══════════════════════════════════════════════════
+@app.on_event("startup")
+async def startup():
+    log.info("Loading models on startup...")
+    Models().load_all()
+    log.info("API ready!")
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}
 
-
-# ═══════════════════════════════════════════════════
-#  Sync endpoint — upload, process, return results
-# ═══════════════════════════════════════════════════
 
 @app.post("/extract")
 async def extract_pdf(
@@ -53,29 +50,20 @@ async def extract_pdf(
     start_page: int = 1,
     end_page: int = None,
 ):
-    """
-    Upload a PDF and get extraction results immediately.
-    Returns JSON with all pages, OCR text, and chart descriptions.
-
-    For large PDFs (100+ pages), use /extract/async instead.
-    """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files accepted")
 
-    # Save uploaded file
     job_id = uuid4().hex[:12]
     pdf_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
     with open(pdf_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        f.write(await file.read())
 
     output_dir = RESULTS_DIR / job_id
 
     try:
-        json_path, md_path, report = await process_pdf(
+        json_path, md_path, report = process_pdf(
             str(pdf_path), str(output_dir), start_page, end_page
         )
-
         return JSONResponse({
             "job_id": job_id,
             "source": file.filename,
@@ -88,51 +76,36 @@ async def extract_pdf(
             "download_zip": f"/download/{job_id}/all",
             "pages": report["pages"],
         })
-
     except Exception as e:
         log.error(f"Extract failed: {e}")
         raise HTTPException(500, str(e))
-
     finally:
-        # Cleanup uploaded PDF
         pdf_path.unlink(missing_ok=True)
 
 
-# ═══════════════════════════════════════════════════
-#  Async endpoint — for large PDFs
-# ═══════════════════════════════════════════════════
-
 @app.post("/extract/async")
-async def extract_pdf_async(
+async def extract_async(
     file: UploadFile = File(...),
     start_page: int = 1,
     end_page: int = None,
-    background_tasks: BackgroundTasks = None,
 ):
-    """
-    Upload a large PDF. Processing happens in background.
-    Poll /status/{job_id} for progress. Download when done.
-    """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(400, "Only PDF files accepted")
 
     job_id = uuid4().hex[:12]
     pdf_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
     with open(pdf_path, "wb") as f:
-        content = await file.read()
-        f.write(content)
+        f.write(await file.read())
 
     output_dir = RESULTS_DIR / job_id
-    jobs[job_id] = {"status": "processing", "filename": file.filename, "started": datetime.now().isoformat()}
+    jobs[job_id] = {"status": "processing", "filename": file.filename}
 
-    async def run_job():
+    import asyncio
+    async def run():
         try:
-            json_path, md_path, report = await process_pdf(
-                str(pdf_path), str(output_dir), start_page, end_page
-            )
+            _, _, report = process_pdf(str(pdf_path), str(output_dir), start_page, end_page)
             jobs[job_id] = {
                 "status": "done",
-                "filename": file.filename,
                 "pages_processed": report["pages_processed"],
                 "charts_found": report["charts_found"],
                 "total_time_sec": report["total_time_sec"],
@@ -145,51 +118,39 @@ async def extract_pdf_async(
         finally:
             pdf_path.unlink(missing_ok=True)
 
-    asyncio.create_task(run_job())
-
+    asyncio.create_task(run())
     return {"job_id": job_id, "status": "processing", "poll": f"/status/{job_id}"}
 
 
 @app.get("/status/{job_id}")
-async def job_status(job_id: str):
+async def status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
     return jobs[job_id]
 
 
-# ═══════════════════════════════════════════════════
-#  Download endpoints
-# ═══════════════════════════════════════════════════
-
 @app.get("/download/{job_id}/extraction.json")
-async def download_json(job_id: str):
-    path = RESULTS_DIR / job_id / "extraction.json"
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(path, filename=f"{job_id}_extraction.json", media_type="application/json")
+async def dl_json(job_id: str):
+    p = RESULTS_DIR / job_id / "extraction.json"
+    if not p.exists(): raise HTTPException(404)
+    return FileResponse(p, filename=f"{job_id}_extraction.json")
 
 
 @app.get("/download/{job_id}/full.md")
-async def download_md(job_id: str):
-    path = RESULTS_DIR / job_id / "full.md"
-    if not path.exists():
-        raise HTTPException(404, "File not found")
-    return FileResponse(path, filename=f"{job_id}_full.md", media_type="text/markdown")
+async def dl_md(job_id: str):
+    p = RESULTS_DIR / job_id / "full.md"
+    if not p.exists(): raise HTTPException(404)
+    return FileResponse(p, filename=f"{job_id}_full.md")
 
 
 @app.get("/download/{job_id}/all")
-async def download_all(job_id: str):
-    result_dir = RESULTS_DIR / job_id
-    if not result_dir.exists():
-        raise HTTPException(404, "Results not found")
-    zip_path = RESULTS_DIR / f"{job_id}.zip"
-    shutil.make_archive(str(zip_path).replace('.zip', ''), 'zip', str(result_dir))
-    return FileResponse(zip_path, filename=f"{job_id}_results.zip", media_type="application/zip")
+async def dl_zip(job_id: str):
+    d = RESULTS_DIR / job_id
+    if not d.exists(): raise HTTPException(404)
+    z = RESULTS_DIR / f"{job_id}.zip"
+    shutil.make_archive(str(z).replace('.zip', ''), 'zip', str(d))
+    return FileResponse(z, filename=f"{job_id}_results.zip")
 
-
-# ═══════════════════════════════════════════════════
-#  Run
-# ═══════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
