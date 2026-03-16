@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image
 from pdf2image import convert_from_path
 from dotenv import load_dotenv
-
+import threading
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
@@ -294,36 +294,52 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     total_charts = sum(len(v) for v in chart_crops.values())
     log.info(f'Phase 3 (filter): {total_charts} charts in {time.time()-t0:.1f}s')
 
-    # ── Phase 4: OCR all pages ──
-    t0 = time.time()
-    all_pages = []
-    for idx, img in enumerate(page_images):
-        pn = start_page + idx
-        t1 = time.time()
-        text = m.ocr(img)
-        dt = time.time() - t1
-        tag = ' +chart' if pn in chart_crops else ''
-        log.info(f'  [OCR] Pg {pn}: {len(text)} chars [{dt:.2f}s]{tag}')
-        all_pages.append({'page': pn, 'ocr_text': text, 'has_chart': pn in chart_crops})
-        torch.cuda.empty_cache()
+    # ── Phase 4+5: OCR + Qwen in PARALLEL ──
+    import threading
 
-    ocr_time = time.time() - t0
-    log.info(f'Phase 4 (OCR): {len(all_pages)} pages in {ocr_time:.1f}s ({ocr_time/len(all_pages):.2f}s/page)')
+    ocr_results = [None]
+    qwen_done = [False]
 
-    # ── Phase 5: Qwen chart descriptions ──
-    t0 = time.time()
-    for pn, charts in chart_crops.items():
-        for i, ch in enumerate(charts):
+    def run_ocr():
+        t0 = time.time()
+        pages = []
+        for idx, img in enumerate(page_images):
+            pn = start_page + idx
             t1 = time.time()
-            crop = Image.open(ch['crop_path'])
-            area = crop.width * crop.height
-            max_tok = 600 if area > 500000 else 400 if area > 250000 else 250
-            desc = m.describe_chart(crop, max_tok)
-            ch['description'] = desc
-            log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
+            text = m.ocr(img)
+            dt = time.time() - t1
+            tag = ' +chart' if pn in chart_crops else ''
+            log.info(f'  [OCR] Pg {pn}: {len(text)} chars [{dt:.2f}s]{tag}')
+            pages.append({'page': pn, 'ocr_text': text, 'has_chart': pn in chart_crops})
             torch.cuda.empty_cache()
+        ocr_time = time.time() - t0
+        log.info(f'  [OCR] Done: {len(pages)} pages in {ocr_time:.1f}s ({ocr_time/len(pages):.2f}s/page)')
+        ocr_results[0] = pages
 
-    log.info(f'Phase 5 (Qwen): {total_charts} charts in {time.time()-t0:.1f}s')
+    def run_qwen():
+        t0 = time.time()
+        for pn, charts in chart_crops.items():
+            for i, ch in enumerate(charts):
+                t1 = time.time()
+                crop = Image.open(ch['crop_path'])
+                area = crop.width * crop.height
+                max_tok = 600 if area > 500000 else 400 if area > 250000 else 250
+                desc = m.describe_chart(crop, max_tok)
+                ch['description'] = desc
+                log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
+                torch.cuda.empty_cache()
+        log.info(f'  [Qwen] Done: {sum(len(v) for v in chart_crops.values())} charts in {time.time()-t0:.1f}s')
+
+    log.info('Phase 4+5: OCR + Qwen PARALLEL...')
+    t0 = time.time()
+    t_ocr = threading.Thread(target=run_ocr)
+    t_qwen = threading.Thread(target=run_qwen)
+    t_ocr.start()
+    t_qwen.start()
+    t_ocr.join()
+    t_qwen.join()
+    all_pages = ocr_results[0]
+    log.info(f'Phase 4+5 total: {time.time()-t0:.1f}s (parallel)')
 
     # ── Phase 6: Merge + save ──
     for p in all_pages:
