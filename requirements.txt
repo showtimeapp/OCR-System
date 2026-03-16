@@ -1,0 +1,13 @@
+torch
+torchvision
+vllm
+fastapi
+uvicorn
+python-multipart
+aiohttp
+aiofiles
+ultralytics
+pdf2image
+Pillow
+pdfplumber
+huggingface_hub
