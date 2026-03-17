@@ -4,7 +4,7 @@ Production Pipeline v2 — GLM-OCR SDK (vLLM) + YOLO + Qwen Direct
 - Charts: YOLO detect → GLM filter → Qwen describe (direct)
 """
 
-import os, json, time, gc, logging, shutil
+import os, json, time, gc, logging, shutil,re,base64
 from pathlib import Path
 from datetime import datetime
 
@@ -311,7 +311,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             t1 = time.time()
             crop = Image.open(ch['crop_path'])
             area = crop.width * crop.height
-            max_tok = 600 if area > 500000 else 400 if area > 250000 else 250
+            max_tok = 900 if area > 500000 else 600 if area > 250000 else 400
             desc = cm.describe_chart(crop, max_tok)
             ch['description'] = desc
             log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
@@ -354,17 +354,24 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    # Save markdown — use SDK markdown + insert chart descriptions
-    md_lines = sdk_md.split('\n') if sdk_md else []
+    # Split SDK markdown into pages (separated by ---)
+    sdk_sections = re.split(r'\n---\n', sdk_md) if sdk_md else []
+    
+    # Insert chart descriptions into correct page sections
     for pn, charts in chart_crops.items():
-        for ch in charts:
-            desc = ch.get('description', '')
-            if desc:
-                md_lines.append(f'\n📊 [Page {pn} Chart: {desc}]\n')
-
+        page_idx = pn - start  # 0-indexed
+        if page_idx < len(sdk_sections):
+            chart_text = ''
+            for ch in charts:
+                desc = ch.get('description', '')
+                if desc:
+                    chart_text += f'\n\n📊 **[Chart Description]**: {desc}\n'
+            sdk_sections[page_idx] = sdk_sections[page_idx] + chart_text
+    
+    final_md = '\n---\n'.join(sdk_sections)
     md_path = output_dir / 'full.md'
     with open(md_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(md_lines))
+        f.write(final_md)
 
     log.info(f'═══ Done: {pdf_path.name} | {len(all_pages)} pages | {total_charts} charts | {total_time:.1f}s ({total_time/max(len(all_pages),1):.2f}s/page)')
 
