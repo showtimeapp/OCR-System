@@ -317,26 +317,67 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
     log.info(f'Phase 4 (Qwen): {total_charts} charts in {time.time()-t0:.1f}s')
 
-    # ── Phase 5: Merge OCR + charts → final output ──
+    # ── Phase 5: Merge + save ──
     total_time = time.time() - t_total
-
-    # Build page-level data from SDK
     all_pages = []
     if isinstance(sdk_pages, list):
         for idx, page_data in enumerate(sdk_pages):
             pn = start + idx
-            if isinstance(page_data, list):
-                text = '\n\n'.join([item.get('content', '') for item in page_data if isinstance(item, dict)])
-            elif isinstance(page_data, dict):
-                text = page_data.get('content', '')
-            else:
-                text = str(page_data)
+            img = page_images[idx] if idx < len(page_images) else None
+            page_w = img.size[0] if img else 0
+            page_h = img.size[1] if img else 0
 
-            page = {'page': pn, 'ocr_text': text, 'has_chart': pn in chart_crops}
+            # Build text blocks with coordinates
+            blocks = []
+            if isinstance(page_data, list):
+                for item in page_data:
+                    if isinstance(item, dict):
+                        block = {
+                            'type': 'text',
+                            'index': item.get('index', 0),
+                            'label': item.get('label', 'text'),
+                            'content': item.get('content', ''),
+                            'bbox': item.get('bbox_2d', None),
+                            'page': pn,
+                            'page_size': [page_w, page_h]
+                        }
+                        blocks.append(block)
+            elif isinstance(page_data, dict):
+                blocks.append({
+                    'type': 'text',
+                    'index': 0,
+                    'label': page_data.get('label', 'text'),
+                    'content': page_data.get('content', ''),
+                    'bbox': page_data.get('bbox_2d', None),
+                    'page': pn,
+                    'page_size': [page_w, page_h]
+                })
+
+            # Add chart blocks with coordinates
             if pn in chart_crops:
-                page['charts'] = [{'bbox': ch['bbox'], 'conf': ch['conf'],
-                    'crop_path': ch.get('crop_path', ''),
-                    'description': ch.get('description', '')} for ch in chart_crops[pn]]
+                for ci, ch in enumerate(chart_crops[pn]):
+                    blocks.append({
+                        'type': 'chart',
+                        'index': ci,
+                        'label': 'chart',
+                        'content': ch.get('description', ''),
+                        'bbox': ch['bbox'],
+                        'conf': ch['conf'],
+                        'crop_path': ch.get('crop_path', ''),
+                        'page': pn,
+                        'page_size': [page_w, page_h]
+                    })
+
+            # Full page text for backward compatibility
+            full_text = '\n\n'.join([b['content'] for b in blocks if b['type'] == 'text'])
+
+            page = {
+                'page': pn,
+                'page_size': [page_w, page_h],
+                'ocr_text': full_text,
+                'has_chart': pn in chart_crops,
+                'blocks': blocks
+            }
             all_pages.append(page)
 
     # Save JSON
