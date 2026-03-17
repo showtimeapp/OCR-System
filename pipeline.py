@@ -206,7 +206,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     sdk_output.mkdir(exist_ok=True)
 
     from glmocr import parse
-    result = parse(str(pdf_path), config=GLMOCR_CONFIG)
+    result = parse(str(pdf_path), config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
     result.save(output_dir=str(sdk_output))
 
     # Read SDK JSON output
