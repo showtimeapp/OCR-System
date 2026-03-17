@@ -1,7 +1,7 @@
 """Test client — send PDF, download results"""
 import requests, sys, time
 
-API = "http://34.93.200.158"
+API = "http://34.100.176.183"
 
 def extract(pdf_path):
     print(f'Uploading {pdf_path}...')
