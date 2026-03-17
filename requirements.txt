@@ -11,3 +11,5 @@ pdfplumber
 huggingface_hub
 aiofiles
 aiohttp
+requests
+glmocr

@@ -1,6 +1,6 @@
 """
-FastAPI — PDF Extraction API
-Upload PDF → Get JSON + Markdown
+FastAPI — PDF Extraction API v2
+GLM-OCR SDK (vLLM) + YOLO + Qwen Direct
 """
 
 import os, json, shutil, logging
@@ -8,19 +8,19 @@ from pathlib import Path
 from datetime import datetime
 from uuid import uuid4
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from pipeline import process_pdf, Models
+from pipeline import process_pdf, ChartModels
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('api')
 
 app = FastAPI(
-    title="PDF Financial Document Extractor",
-    description="Upload PDF → Get structured JSON + Markdown with chart descriptions",
-    version="1.0.0",
+    title="PDF Financial Document Extractor v2",
+    description="GLM-OCR SDK (vLLM) + YOLO + Qwen Direct | Upload PDF → JSON + Markdown",
+    version="2.0.0",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -34,8 +34,8 @@ jobs = {}
 
 @app.on_event("startup")
 async def startup():
-    log.info("Loading models on startup...")
-    Models().load_all()
+    log.info("Pre-loading chart models (YOLO + Qwen)...")
+    ChartModels().load()
     log.info("API ready!")
 
 
@@ -77,7 +77,7 @@ async def extract_pdf(
             "pages": report["pages"],
         })
     except Exception as e:
-        log.error(f"Extract failed: {e}")
+        log.error(f"Extract failed: {e}", exc_info=True)
         raise HTTPException(500, str(e))
     finally:
         pdf_path.unlink(missing_ok=True)
@@ -154,4 +154,4 @@ async def dl_zip(job_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
+    uvicorn.run(app, host="0.0.0.0", port=80, workers=1)

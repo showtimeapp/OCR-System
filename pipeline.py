@@ -1,20 +1,19 @@
 """
-Production Pipeline — Direct Inference on L4 GPU
-GLM-OCR (0.22s/page) + YOLO + Qwen3-VL (7.5s/chart)
+Production Pipeline v2 — GLM-OCR SDK (vLLM) + YOLO + Qwen Direct
+- OCR: GLM-OCR SDK via vLLM (2.1s/page)
+- Charts: YOLO detect → GLM filter → Qwen describe (direct)
 """
 
-import os, json, time, gc, base64, logging, asyncio
+import os, json, time, gc, logging, shutil
 from pathlib import Path
-from io import BytesIO
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import numpy as np
 from PIL import Image
 from pdf2image import convert_from_path
 from dotenv import load_dotenv
-import threading
+
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%H:%M:%S')
@@ -28,20 +27,26 @@ DPI = int(os.getenv("DPI", "100"))
 MAX_SIDE = int(os.getenv("MAX_SIDE", "800"))
 CHART_MIN_AREA = float(os.getenv("CHART_MIN_AREA", "0.05"))
 MERGE_GAP = int(os.getenv("MERGE_GAP", "80"))
-OCR_MAX_TOKENS = int(os.getenv("OCR_MAX_TOKENS", "1024"))
 QWEN_UPSCALE = int(os.getenv("QWEN_UPSCALE", "800"))
+GLMOCR_CONFIG = os.getenv("GLMOCR_CONFIG", os.path.expanduser("~/pipeline/config.yaml"))
 
-CHART_PROMPT = os.getenv("CHART_PROMPT", """Read every number carefully. Commas are thousand separators (11,323 = eleven thousand 323, NOT 11.23).
-if is not chart or graph do not give any response ,else Give the concise discription of chart such that if someone reading your text can undersand everything about that chart without looking into chart, also strictly mention all the data points of the chart with small explanation""")
+CHART_PROMPT = """Read every number carefully. Commas are thousand separators (11,323 = eleven thousand 323, NOT 11.23).
+1. Chart title and type
+2. EVERY bar/line/slice with EXACT label and number
+3. EVERY percentage, growth rate, YoY change
+4. Time periods
+5. Multiple series/colors with values
+6. Overall trend
+Write as flowing sentences. Reader should know every data point without seeing the chart."""
 
 FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 
 
 # ═══════════════════════════════════════════════════
-#  MODEL MANAGER — load once, keep forever
+#  MODELS — Qwen + YOLO (loaded once)
 # ═══════════════════════════════════════════════════
 
-class Models:
+class ChartModels:
     _instance = None
 
     def __new__(cls):
@@ -50,21 +55,17 @@ class Models:
             cls._instance._loaded = False
         return cls._instance
 
-    def load_all(self):
+    def load(self):
         if self._loaded:
             return
 
-        # GLM-OCR
-        log.info('Loading GLM-OCR...')
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-        self.ocr_processor = AutoProcessor.from_pretrained('zai-org/GLM-OCR')
-        self.ocr_model = AutoModelForImageTextToText.from_pretrained(
-            'zai-org/GLM-OCR', dtype=torch.float16
-        ).to('cuda')
-        self.ocr_model.eval()
-        log.info(f'  GLM-OCR: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+        # GLM-OCR for filter (lightweight, reuse vLLM)
+        log.info('Loading GLM-OCR filter client...')
+        import aiohttp
+        self.glm_url = os.getenv("GLM_OCR_URL", "http://localhost:8090/v1/chat/completions")
+        self.glm_model = os.getenv("GLM_MODEL_NAME", "glm-ocr")
 
-        # Qwen3-VL
+        # Qwen3-VL direct
         log.info('Loading Qwen3-VL...')
         from transformers import Qwen3VLForConditionalGeneration, AutoProcessor as QP
         self.qwen_processor = QP.from_pretrained(
@@ -74,7 +75,7 @@ class Models:
             'Qwen/Qwen3-VL-4B-Instruct', torch_dtype=torch.float16
         ).to('cuda')
         self.qwen_model.eval()
-        log.info(f'  Qwen: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+        log.info(f'  Qwen GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
 
         # YOLO
         log.info('Loading YOLO...')
@@ -88,35 +89,51 @@ class Models:
         self.picture_id = [k for k, v in self.yolo.names.items() if v == 'Picture'][0]
 
         self._loaded = True
-        log.info(f'All models loaded | GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+        log.info(f'All chart models loaded | GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
 
-    # ── GLM-OCR inference ──
-    def ocr(self, image):
-        messages = [{'role': 'user', 'content': [
-            {'type': 'image'}, {'type': 'text', 'text': 'Document Parsing:'}
-        ]}]
-        text = self.ocr_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.ocr_processor(text=[text], images=[image], return_tensors='pt').to('cuda')
-        with torch.inference_mode():
-            out = self.ocr_model.generate(**inputs, max_new_tokens=OCR_MAX_TOKENS)
-        result = self.ocr_processor.decode(out[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        del inputs, out
-        return result.strip()
+    def unload_qwen(self):
+        """Free Qwen from GPU to make room for vLLM."""
+        if hasattr(self, 'qwen_model'):
+            del self.qwen_model
+            del self.qwen_processor
+            torch.cuda.empty_cache()
+            gc.collect()
+            self._loaded = False
+            log.info('Qwen unloaded from GPU')
 
-    # ── GLM-OCR filter ──
+    def load_qwen(self):
+        """Reload Qwen onto GPU."""
+        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor as QP
+        self.qwen_processor = QP.from_pretrained(
+            'Qwen/Qwen3-VL-4B-Instruct', min_pixels=256*256, max_pixels=1280*960
+        )
+        self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
+            'Qwen/Qwen3-VL-4B-Instruct', torch_dtype=torch.float16
+        ).to('cuda')
+        self.qwen_model.eval()
+        log.info(f'Qwen reloaded | GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+
+    # ── GLM filter via vLLM HTTP ──
     def is_chart(self, image):
-        messages = [{'role': 'user', 'content': [
-            {'type': 'image'}, {'type': 'text', 'text': FILTER_PROMPT}
-        ]}]
-        text = self.ocr_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.ocr_processor(text=[text], images=[image], return_tensors='pt').to('cuda')
-        with torch.inference_mode():
-            out = self.ocr_model.generate(**inputs, max_new_tokens=5)
-        result = self.ocr_processor.decode(out[0][inputs['input_ids'].shape[1]:], skip_special_tokens=True)
-        del inputs, out
+        import requests, base64
+        from io import BytesIO
+        buf = BytesIO()
+        image.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+
+        resp = requests.post(self.glm_url, json={
+            "model": self.glm_model,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                {"type": "text", "text": FILTER_PROMPT}
+            ]}],
+            "max_tokens": 5,
+            "temperature": 0,
+        }, timeout=30)
+        result = resp.json()['choices'][0]['message']['content']
         return 'yes' in result.strip().lower()
 
-    # ── Qwen chart description ──
+    # ── Qwen chart description (direct) ──
     def describe_chart(self, image, max_tokens=600):
         if max(image.size) < QWEN_UPSCALE:
             s = QWEN_UPSCALE / max(image.size)
@@ -138,6 +155,7 @@ class Models:
         gen = out[:, inputs['input_ids'].shape[1]:]
         result = self.qwen_processor.batch_decode(gen, skip_special_tokens=True)[0]
         del inputs, out, gen
+        torch.cuda.empty_cache()
         return result.strip()
 
 
@@ -167,65 +185,59 @@ def merge_boxes(boxes, gap=MERGE_GAP):
     return boxes
 
 
-def build_markdown(all_pages, page_images, start_page, pdf_name):
-    lines = [f'# {pdf_name}\n']
-    for p in all_pages:
-        pn = p['page']
-        lines.append(f'\n---\n## Page {pn}\n')
-        text = p.get('ocr_text', '')
-        charts = p.get('charts', [])
-        if not charts:
-            lines.append(text)
-            continue
-        img = page_images[pn - start_page]
-        img_h = img.size[1]
-        text_lines = text.split('\n')
-        total_lines = max(len(text_lines), 1)
-        inserts = {}
-        for ch in charts:
-            bbox = ch.get('bbox', [0, 0, 0, 0])
-            mid_y = (bbox[1] + bbox[3]) / 2
-            pos = min(int((mid_y / img_h) * total_lines), total_lines - 1)
-            desc = ch.get('description', '')
-            if desc:
-                inserts[pos] = inserts.get(pos, '') + f'\n\U0001F4CA [Chart: {desc}]\n'
-        result = []
-        for i, line in enumerate(text_lines):
-            result.append(line)
-            if i in inserts:
-                result.append(inserts[i])
-        lines.append('\n'.join(result))
-    return '\n'.join(lines)
-
-
 # ═══════════════════════════════════════════════════
 #  MAIN PIPELINE
 # ═══════════════════════════════════════════════════
 
 def process_pdf(pdf_path, output_dir=None, start=1, end=None):
-    """Full pipeline. Returns (json_path, md_path, report)."""
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir or f'./results/{pdf_path.stem}')
     output_dir.mkdir(parents=True, exist_ok=True)
     charts_dir = output_dir / 'charts'
     charts_dir.mkdir(exist_ok=True)
 
-    m = Models()
-    m.load_all()
-
     log.info(f'═══ Processing: {pdf_path.name}')
     t_total = time.time()
 
-    # ── Phase 1: PDF → images ──
+    # ── Phase 1: GLM-OCR SDK (vLLM backend) — OCR all pages ──
+    log.info('Phase 1: GLM-OCR SDK...')
+    t0 = time.time()
+    sdk_output = output_dir / 'sdk_raw'
+    sdk_output.mkdir(exist_ok=True)
+
+    from glmocr import parse
+    result = parse(str(pdf_path), config=GLMOCR_CONFIG)
+    result.save(output_dir=str(sdk_output))
+
+    # Read SDK JSON output
+    sdk_json = list(sdk_output.rglob('*.json'))
+    if sdk_json:
+        with open(sdk_json[0], 'r', encoding='utf-8') as f:
+            sdk_pages = json.load(f)
+    else:
+        sdk_pages = []
+
+    # Read SDK markdown
+    sdk_md_files = list(sdk_output.rglob('*.md'))
+    sdk_md = ""
+    if sdk_md_files:
+        with open(sdk_md_files[0], 'r', encoding='utf-8') as f:
+            sdk_md = f.read()
+
+    ocr_time = time.time() - t0
+    num_pages = len(sdk_pages) if isinstance(sdk_pages, list) else 0
+    log.info(f'Phase 1 (OCR): {num_pages} pages in {ocr_time:.1f}s ({ocr_time/max(num_pages,1):.2f}s/page)')
+
+    # ── Phase 2: YOLO chart detection ──
+    log.info('Phase 2: YOLO + chart detection...')
+    t0 = time.time()
+
     import pdfplumber
     with pdfplumber.open(str(pdf_path)) as pdf:
         total_pages = len(pdf.pages)
-    end = min(end or total_pages, total_pages)
-    start_page = start
+    last = min(end or total_pages, total_pages)
 
-    t0 = time.time()
-    raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=end,
-                            fmt='png', thread_count=8)
+    raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=last, fmt='png', thread_count=8)
     page_images = []
     for img in raw:
         r = MAX_SIDE / max(img.size)
@@ -233,20 +245,19 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             img = img.resize((int(img.width * r), int(img.height * r)), Image.LANCZOS)
         page_images.append(img)
     del raw
-    log.info(f'Phase 1 (PDF→images): {len(page_images)} pages in {time.time()-t0:.1f}s')
 
-    # ── Phase 2: YOLO detection ──
-    t0 = time.time()
+    cm = ChartModels()
+    cm.load()
+
     raw_boxes = {}
     for idx, img in enumerate(page_images):
-        pn = start_page + idx
+        pn = start + idx
         img_w, img_h = img.size
-        results = m.yolo.predict(source=np.array(img), conf=0.3, verbose=False,
-                                 imgsz=640, device='cuda:0')
+        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
         if results and results[0].boxes is not None:
             page_boxes = []
             for i in range(len(results[0].boxes)):
-                if int(results[0].boxes.cls[i]) != m.picture_id: continue
+                if int(results[0].boxes.cls[i]) != cm.picture_id: continue
                 x1, y1, x2, y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
                 if ((x2 - x1) * (y2 - y1)) / (img_w * img_h) < CHART_MIN_AREA: continue
                 conf = float(results[0].boxes.conf[i])
@@ -254,10 +265,9 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             if page_boxes:
                 raw_boxes[pn] = page_boxes
 
-    # Merge + crop (small margin for filter)
     raw_crops = []
     for pn, boxes in raw_boxes.items():
-        img = page_images[pn - start_page]
+        img = page_images[pn - start]
         img_w, img_h = img.size
         merged = merge_boxes(boxes)
         for b in merged:
@@ -267,16 +277,16 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             crop = img.crop((fx1, fy1, fx2, fy2))
             raw_crops.append({'page': pn, 'crop': crop, 'bbox': [x1, y1, x2, y2], 'conf': round(conf, 3)})
 
-    log.info(f'Phase 2 (YOLO): {len(raw_crops)} crops in {time.time()-t0:.1f}s')
+    log.info(f'  YOLO: {len(raw_crops)} crops in {time.time()-t0:.1f}s')
 
-    # ── Phase 3: GLM-OCR filter ──
+    # ── Phase 3: GLM filter via vLLM ──
     t0 = time.time()
     chart_crops = {}
     for c in raw_crops:
-        if m.is_chart(c['crop']):
+        if cm.is_chart(c['crop']):
             pn = c['page']
             if pn not in chart_crops: chart_crops[pn] = []
-            img = page_images[pn - start_page]
+            img = page_images[pn - start]
             img_w, img_h = img.size
             x1, y1, x2, y2 = c['bbox']
             bx1, by1 = max(0, x1 - 40), max(0, y1 - 60)
@@ -292,65 +302,44 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             log.info(f'  Pg {c["page"]}: skip')
 
     total_charts = sum(len(v) for v in chart_crops.values())
-    log.info(f'Phase 3 (filter): {total_charts} charts in {time.time()-t0:.1f}s')
+    log.info(f'  Filter: {total_charts} charts in {time.time()-t0:.1f}s')
 
-    # ── Phase 4+5: OCR + Qwen in PARALLEL ──
-    import threading
-
-    ocr_results = [None]
-    qwen_done = [False]
-
-    def run_ocr():
-        t0 = time.time()
-        pages = []
-        for idx, img in enumerate(page_images):
-            pn = start_page + idx
-            t1 = time.time()
-            text = m.ocr(img)
-            dt = time.time() - t1
-            tag = ' +chart' if pn in chart_crops else ''
-            log.info(f'  [OCR] Pg {pn}: {len(text)} chars [{dt:.2f}s]{tag}')
-            pages.append({'page': pn, 'ocr_text': text, 'has_chart': pn in chart_crops})
-            torch.cuda.empty_cache()
-        ocr_time = time.time() - t0
-        log.info(f'  [OCR] Done: {len(pages)} pages in {ocr_time:.1f}s ({ocr_time/len(pages):.2f}s/page)')
-        ocr_results[0] = pages
-
-    def run_qwen():
-        t0 = time.time()
-        for pn, charts in chart_crops.items():
-            for i, ch in enumerate(charts):
-                t1 = time.time()
-                crop = Image.open(ch['crop_path'])
-                area = crop.width * crop.height
-                max_tok = 600 if area > 500000 else 400 if area > 250000 else 250
-                desc = m.describe_chart(crop, max_tok)
-                ch['description'] = desc
-                log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
-                torch.cuda.empty_cache()
-        log.info(f'  [Qwen] Done: {sum(len(v) for v in chart_crops.values())} charts in {time.time()-t0:.1f}s')
-
-    log.info('Phase 4+5: OCR + Qwen PARALLEL...')
+    # ── Phase 4: Qwen chart descriptions (direct) ──
     t0 = time.time()
-    t_ocr = threading.Thread(target=run_ocr)
-    t_qwen = threading.Thread(target=run_qwen)
-    t_ocr.start()
-    t_qwen.start()
-    t_ocr.join()
-    t_qwen.join()
-    all_pages = ocr_results[0]
-    log.info(f'Phase 4+5 total: {time.time()-t0:.1f}s (parallel)')
+    for pn, charts in chart_crops.items():
+        for i, ch in enumerate(charts):
+            t1 = time.time()
+            crop = Image.open(ch['crop_path'])
+            area = crop.width * crop.height
+            max_tok = 600 if area > 500000 else 400 if area > 250000 else 250
+            desc = cm.describe_chart(crop, max_tok)
+            ch['description'] = desc
+            log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
+    log.info(f'Phase 4 (Qwen): {total_charts} charts in {time.time()-t0:.1f}s')
 
-    # ── Phase 6: Merge + save ──
-    for p in all_pages:
-        pn = p['page']
-        if pn in chart_crops:
-            p['charts'] = [{'bbox': ch['bbox'], 'conf': ch['conf'],
-                            'crop_path': ch.get('crop_path', ''),
-                            'description': ch.get('description', '')} for ch in chart_crops[pn]]
-
+    # ── Phase 5: Merge OCR + charts → final output ──
     total_time = time.time() - t_total
 
+    # Build page-level data from SDK
+    all_pages = []
+    if isinstance(sdk_pages, list):
+        for idx, page_data in enumerate(sdk_pages):
+            pn = start + idx
+            if isinstance(page_data, list):
+                text = '\n\n'.join([item.get('content', '') for item in page_data if isinstance(item, dict)])
+            elif isinstance(page_data, dict):
+                text = page_data.get('content', '')
+            else:
+                text = str(page_data)
+
+            page = {'page': pn, 'ocr_text': text, 'has_chart': pn in chart_crops}
+            if pn in chart_crops:
+                page['charts'] = [{'bbox': ch['bbox'], 'conf': ch['conf'],
+                    'crop_path': ch.get('crop_path', ''),
+                    'description': ch.get('description', '')} for ch in chart_crops[pn]]
+            all_pages.append(page)
+
+    # Save JSON
     report = {
         'source': str(pdf_path),
         'total_pages': total_pages,
@@ -361,54 +350,29 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         'extracted_at': datetime.now().isoformat(),
         'pages': all_pages,
     }
-
     json_path = output_dir / 'extraction.json'
-    with open(json_path, 'w') as f:
+    with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    md = build_markdown(all_pages, chart_crops if chart_crops else {}, page_images, start_page, pdf_path.stem)
-    md_path = output_dir / 'full.md'
-    with open(md_path, 'w') as f:
-        f.write(md)
+    # Save markdown — use SDK markdown + insert chart descriptions
+    md_lines = sdk_md.split('\n') if sdk_md else []
+    for pn, charts in chart_crops.items():
+        for ch in charts:
+            desc = ch.get('description', '')
+            if desc:
+                md_lines.append(f'\n📊 [Page {pn} Chart: {desc}]\n')
 
-    log.info(f'═══ Done: {pdf_path.name} | {len(all_pages)} pages | {total_charts} charts | {total_time:.1f}s ({total_time/len(all_pages):.2f}s/page)')
+    md_path = output_dir / 'full.md'
+    with open(md_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(md_lines))
+
+    log.info(f'═══ Done: {pdf_path.name} | {len(all_pages)} pages | {total_charts} charts | {total_time:.1f}s ({total_time/max(len(all_pages),1):.2f}s/page)')
 
     del page_images
     gc.collect()
     torch.cuda.empty_cache()
 
     return json_path, md_path, report
-
-
-# Fix build_markdown to accept correct args
-def build_markdown(all_pages, chart_crops, page_images, start_page, pdf_name):
-    lines = [f'# {pdf_name}\n']
-    for p in all_pages:
-        pn = p['page']
-        lines.append(f'\n---\n## Page {pn}\n')
-        text = p.get('ocr_text', '')
-        charts = p.get('charts', [])
-        if not charts:
-            lines.append(text)
-            continue
-        img_h = 800  # default
-        text_lines = text.split('\n')
-        total_lines = max(len(text_lines), 1)
-        inserts = {}
-        for ch in charts:
-            bbox = ch.get('bbox', [0, 0, 0, 0])
-            mid_y = (bbox[1] + bbox[3]) / 2
-            pos = min(int((mid_y / img_h) * total_lines), total_lines - 1)
-            desc = ch.get('description', '')
-            if desc:
-                inserts[pos] = inserts.get(pos, '') + f'\n\U0001F4CA [Chart: {desc}]\n'
-        result = []
-        for i, line in enumerate(text_lines):
-            result.append(line)
-            if i in inserts:
-                result.append(inserts[i])
-        lines.append('\n'.join(result))
-    return '\n'.join(lines)
 
 
 if __name__ == '__main__':
