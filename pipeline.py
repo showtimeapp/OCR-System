@@ -9,7 +9,8 @@ from io import BytesIO
 import requests as req
 from pathlib import Path
 from datetime import datetime
-
+import pdfplumber
+from glmocr import parse
 import torch
 import numpy as np
 from PIL import Image
@@ -163,14 +164,33 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     log.info(f'═══ Processing: {pdf_path.name}')
     t_total = time.time()
 
-    # ── Phase 1: GLM-OCR SDK (vLLM backend) — OCR all pages ──
+    # ── Phase 0: Convert PDF → images ONCE ──
+    log.info('Phase 0: PDF → images...')
+    t0 = time.time()
+    
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        total_pages = len(pdf.pages)
+    last = min(end or total_pages, total_pages)
+
+    raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=last, fmt='png', thread_count=8)
+    page_images = []
+    temp_img_dir = output_dir / 'page_images'; temp_img_dir.mkdir(exist_ok=True)
+    img_paths = []
+    for idx, img in enumerate(raw):
+        r = MAX_SIDE / max(img.size)
+        if r < 1: img = img.resize((int(img.width*r), int(img.height*r)), Image.LANCZOS)
+        page_images.append(img)
+        img_path = temp_img_dir / f'page_{start+idx:04d}.png'
+        img.save(img_path)
+        img_paths.append(str(img_path))
+    del raw
+    log.info(f'Phase 0: {len(page_images)} pages converted in {time.time()-t0:.1f}s')
+
+    # ── Phase 1: GLM-OCR SDK via vLLM (using saved images) ──
     log.info('Phase 1: GLM-OCR SDK...')
     t0 = time.time()
-    sdk_output = output_dir / 'sdk_raw'
-    sdk_output.mkdir(exist_ok=True)
-
-    from glmocr import parse
-    result = parse(str(pdf_path), config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
+    sdk_output = output_dir / 'sdk_raw'; sdk_output.mkdir(exist_ok=True)
+    result = parse(img_paths, config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
     result.save(output_dir=str(sdk_output))
 
     # Read SDK JSON output
@@ -196,20 +216,6 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     log.info('Phase 2: YOLO + chart detection...')
     t0 = time.time()
 
-    import pdfplumber
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        total_pages = len(pdf.pages)
-    last = min(end or total_pages, total_pages)
-
-    raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=last, fmt='png', thread_count=8)
-    page_images = []
-    for img in raw:
-        r = MAX_SIDE / max(img.size)
-        if r < 1:
-            img = img.resize((int(img.width * r), int(img.height * r)), Image.LANCZOS)
-        page_images.append(img)
-    del raw
-
     cm = ChartModels()
     cm.load()
 
@@ -217,7 +223,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     for idx, img in enumerate(page_images):
         pn = start + idx
         img_w, img_h = img.size
-        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cpu')
+        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
         if results and results[0].boxes is not None:
             page_boxes = []
             for i in range(len(results[0].boxes)):
