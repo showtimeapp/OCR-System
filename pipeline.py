@@ -270,13 +270,14 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     t1.start(); t2.start()
     t1.join(); t2.join()
     log.info(f'Parallel phase: {time.time()-t_parallel:.1f}s')
-
+    
+    cm = ChartModels(); cm.load()
     sdk_pages = sdk_result['pages']
     sdk_md = sdk_result['md']
     page_images = yolo_result['page_images']
     chart_crops = yolo_result['chart_crops']
     total_charts = yolo_result['total_charts']
-    
+
     # ── Phase 4: Qwen chart descriptions (direct) ──
     t0 = time.time()
     for pn, charts in chart_crops.items():
