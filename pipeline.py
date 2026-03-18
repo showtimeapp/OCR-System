@@ -66,16 +66,9 @@ class ChartModels:
         self.glm_model = os.getenv("GLM_MODEL_NAME", "glm-ocr")
 
         # Qwen3-VL direct
-        log.info('Loading Qwen3-VL...')
-        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor as QP
-        self.qwen_processor = QP.from_pretrained(
-            'Qwen/Qwen3-VL-4B-Instruct', min_pixels=256*256, max_pixels=1280*960
-        )
-        self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-            'Qwen/Qwen3-VL-4B-Instruct', torch_dtype=torch.float16
-        ).to('cuda')
-        self.qwen_model.eval()
-        log.info(f'  Qwen GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
+        log.info('Qwen via vLLM HTTP (no GPU load needed)')
+        self.qwen_url = os.getenv("QWEN_VL_URL", "http://localhost:8091/v1/chat/completions")
+        self.qwen_model_name = os.getenv("QWEN_MODEL_NAME", "qwen-vl")
 
         # YOLO
         log.info('Loading YOLO...')
@@ -91,27 +84,6 @@ class ChartModels:
         self._loaded = True
         log.info(f'All chart models loaded | GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
 
-    def unload_qwen(self):
-        """Free Qwen from GPU to make room for vLLM."""
-        if hasattr(self, 'qwen_model'):
-            del self.qwen_model
-            del self.qwen_processor
-            torch.cuda.empty_cache()
-            gc.collect()
-            self._loaded = False
-            log.info('Qwen unloaded from GPU')
-
-    def load_qwen(self):
-        """Reload Qwen onto GPU."""
-        from transformers import Qwen3VLForConditionalGeneration, AutoProcessor as QP
-        self.qwen_processor = QP.from_pretrained(
-            'Qwen/Qwen3-VL-4B-Instruct', min_pixels=256*256, max_pixels=1280*960
-        )
-        self.qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-            'Qwen/Qwen3-VL-4B-Instruct', torch_dtype=torch.float16
-        ).to('cuda')
-        self.qwen_model.eval()
-        log.info(f'Qwen reloaded | GPU: {torch.cuda.memory_allocated()/1e9:.1f}GB')
 
     # ── GLM filter via vLLM HTTP ──
     def is_chart(self, image):
@@ -137,27 +109,17 @@ class ChartModels:
     def describe_chart(self, image, max_tokens=600):
         if max(image.size) < QWEN_UPSCALE:
             s = QWEN_UPSCALE / max(image.size)
-            image = image.resize((int(image.width * s), int(image.height * s)), Image.LANCZOS)
-
-        messages = [{'role': 'user', 'content': [
-            {'type': 'image', 'image': image},
-            {'type': 'text', 'text': CHART_PROMPT}
-        ]}]
-        inputs = self.qwen_processor.apply_chat_template(
-            messages, tokenize=True, return_dict=True,
-            return_tensors='pt', add_generation_prompt=True
-        ).to('cuda')
-        with torch.inference_mode():
-            out = self.qwen_model.generate(
-                **inputs, max_new_tokens=max_tokens,
-                do_sample=False, temperature=None, top_p=None
-            )
-        gen = out[:, inputs['input_ids'].shape[1]:]
-        result = self.qwen_processor.batch_decode(gen, skip_special_tokens=True)[0]
-        del inputs, out, gen
-        torch.cuda.empty_cache()
-        return result.strip()
-
+            image = image.resize((int(image.width*s), int(image.height*s)), Image.LANCZOS)
+        buf = BytesIO(); image.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        resp = req.post(self.qwen_url, json={
+            "model": self.qwen_model_name,
+            "messages": [{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
+                {"type":"text","text":CHART_PROMPT}
+            ]}], "max_tokens": max_tokens, "temperature": 0,
+        }, timeout=120)
+        return resp.json()['choices'][0]['message']['content'].strip()
 
 # ═══════════════════════════════════════════════════
 #  HELPERS
