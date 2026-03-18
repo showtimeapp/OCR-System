@@ -190,7 +190,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     log.info('Phase 1: GLM-OCR SDK...')
     t0 = time.time()
     sdk_output = output_dir / 'sdk_raw'; sdk_output.mkdir(exist_ok=True)
-    result = parse(img_paths, config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
+    result = parse(str(temp_img_dir), config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
     if isinstance(result, list):
         for r in result: r.save(output_dir=str(sdk_output))
     else:
