@@ -165,118 +165,118 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     t_total = time.time()
 
     # ── Phase 0: Convert PDF → images ONCE ──
-    log.info('Phase 0: PDF → images...')
-    t0 = time.time()
-    
+    log.info(f'═══ Processing: {pdf_path.name}')
+    t_total = time.time()
+
+    import pdfplumber
     with pdfplumber.open(str(pdf_path)) as pdf:
         total_pages = len(pdf.pages)
     last = min(end or total_pages, total_pages)
 
-    raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=last, fmt='png', thread_count=8)
-    page_images = []
-    temp_img_dir = output_dir / 'page_images'; temp_img_dir.mkdir(exist_ok=True)
-    img_paths = []
-    for idx, img in enumerate(raw):
-        r = MAX_SIDE / max(img.size)
-        if r < 1: img = img.resize((int(img.width*r), int(img.height*r)), Image.LANCZOS)
-        page_images.append(img)
-        img_path = temp_img_dir / f'page_{start+idx:04d}.png'
-        img.save(img_path)
-        img_paths.append(str(img_path))
-    del raw
-    log.info(f'Phase 0: {len(page_images)} pages converted in {time.time()-t0:.1f}s')
+    # ── Run SDK OCR + (Image Convert + YOLO) in PARALLEL ──
+    import threading
 
-    # ── Phase 1: GLM-OCR SDK via vLLM (using saved images) ──
-    log.info('Phase 1: GLM-OCR SDK...')
-    t0 = time.time()
-    sdk_output = output_dir / 'sdk_raw'; sdk_output.mkdir(exist_ok=True)
-    result = parse(str(pdf_path), config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
-    if isinstance(result, list):
-        for r in result: r.save(output_dir=str(sdk_output))
-    else:
-        result.save(output_dir=str(sdk_output))
+    # Thread 1 results
+    sdk_result = {'pages': [], 'md': '', 'time': 0}
+    # Thread 2 results
+    yolo_result = {'page_images': [], 'chart_crops': {}, 'total_charts': 0, 'time': 0}
 
-    # Read SDK JSON output
-    sdk_json = list(sdk_output.rglob('*.json'))
-    if sdk_json:
-        with open(sdk_json[0], 'r', encoding='utf-8') as f:
-            sdk_pages = json.load(f)
-    else:
-        sdk_pages = []
-
-    # Read SDK markdown
-    sdk_md_files = list(sdk_output.rglob('*.md'))
-    sdk_md = ""
-    if sdk_md_files:
-        with open(sdk_md_files[0], 'r', encoding='utf-8') as f:
-            sdk_md = f.read()
-
-    ocr_time = time.time() - t0
-    num_pages = len(sdk_pages) if isinstance(sdk_pages, list) else 0
-    log.info(f'Phase 1 (OCR): {num_pages} pages in {ocr_time:.1f}s ({ocr_time/max(num_pages,1):.2f}s/page)')
-
-    # ── Phase 2: YOLO chart detection ──
-    log.info('Phase 2: YOLO + chart detection...')
-    t0 = time.time()
-
-    cm = ChartModels()
-    cm.load()
-
-    raw_boxes = {}
-    for idx, img in enumerate(page_images):
-        pn = start + idx
-        img_w, img_h = img.size
-        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
-        if results and results[0].boxes is not None:
-            page_boxes = []
-            for i in range(len(results[0].boxes)):
-                if int(results[0].boxes.cls[i]) != cm.picture_id: continue
-                x1, y1, x2, y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
-                if ((x2 - x1) * (y2 - y1)) / (img_w * img_h) < CHART_MIN_AREA: continue
-                conf = float(results[0].boxes.conf[i])
-                page_boxes.append([x1, y1, x2, y2, conf])
-            if page_boxes:
-                raw_boxes[pn] = page_boxes
-
-    raw_crops = []
-    for pn, boxes in raw_boxes.items():
-        img = page_images[pn - start]
-        img_w, img_h = img.size
-        merged = merge_boxes(boxes)
-        for b in merged:
-            x1, y1, x2, y2, conf = b
-            fx1, fy1 = max(0, x1 - 30), max(0, y1 - 30)
-            fx2, fy2 = min(img_w, x2 + 30), min(img_h, y2 + 30)
-            crop = img.crop((fx1, fy1, fx2, fy2))
-            raw_crops.append({'page': pn, 'crop': crop, 'bbox': [x1, y1, x2, y2], 'conf': round(conf, 3)})
-
-    log.info(f'  YOLO: {len(raw_crops)} crops in {time.time()-t0:.1f}s')
-
-    # ── Phase 3: GLM filter via vLLM ──
-    t0 = time.time()
-    chart_crops = {}
-    for c in raw_crops:
-        if cm.is_chart(c['crop']):
-            pn = c['page']
-            if pn not in chart_crops: chart_crops[pn] = []
-            img = page_images[pn - start]
-            img_w, img_h = img.size
-            x1, y1, x2, y2 = c['bbox']
-            bx1, by1 = max(0, x1 - 40), max(0, y1 - 60)
-            bx2, by2 = min(img_w, x2 + 40), min(img_h, y2 + 80)
-            big_crop = img.crop((bx1, by1, bx2, by2))
-            crop_path = charts_dir / f'page_{pn:04d}_chart_{len(chart_crops[pn])+1}.png'
-            big_crop.save(crop_path)
-            chart_crops[pn].append({
-                'crop_path': str(crop_path), 'bbox': [bx1, by1, bx2, by2], 'conf': c['conf']
-            })
-            log.info(f'  Pg {pn}: CHART')
+    def run_sdk_ocr():
+        t0 = time.time()
+        log.info('Phase 1: GLM-OCR SDK...')
+        sdk_output = output_dir / 'sdk_raw'; sdk_output.mkdir(exist_ok=True)
+        from glmocr import parse
+        result = parse(str(pdf_path), config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
+        if isinstance(result, list):
+            for r in result: r.save(output_dir=str(sdk_output))
         else:
-            log.info(f'  Pg {c["page"]}: skip')
+            result.save(output_dir=str(sdk_output))
 
-    total_charts = sum(len(v) for v in chart_crops.values())
-    log.info(f'  Filter: {total_charts} charts in {time.time()-t0:.1f}s')
+        sdk_json = list(sdk_output.rglob('*.json'))
+        if sdk_json:
+            with open(sdk_json[0], 'r', encoding='utf-8') as f:
+                sdk_result['pages'] = json.load(f)
+        sdk_md_files = list(sdk_output.rglob('*.md'))
+        if sdk_md_files:
+            with open(sdk_md_files[0], 'r', encoding='utf-8') as f:
+                sdk_result['md'] = f.read()
+        sdk_result['time'] = time.time() - t0
+        num = len(sdk_result['pages']) if isinstance(sdk_result['pages'], list) else 0
+        log.info(f'Phase 1 (OCR): {num} pages in {sdk_result["time"]:.1f}s ({sdk_result["time"]/max(num,1):.2f}s/page)')
 
+    def run_yolo_pipeline():
+        t0 = time.time()
+        log.info('Phase 0+2: Images + YOLO...')
+
+        # Convert PDF → images
+        raw = convert_from_path(str(pdf_path), dpi=DPI, first_page=start, last_page=last, fmt='png', thread_count=8)
+        page_images = []
+        for idx, img in enumerate(raw):
+            r = MAX_SIDE / max(img.size)
+            if r < 1: img = img.resize((int(img.width*r), int(img.height*r)), Image.LANCZOS)
+            page_images.append(img)
+        del raw
+        yolo_result['page_images'] = page_images
+
+        # YOLO detection
+        cm = ChartModels(); cm.load()
+        raw_boxes = {}
+        for idx, img in enumerate(page_images):
+            pn = start + idx; img_w, img_h = img.size
+            results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
+            if results and results[0].boxes is not None:
+                page_boxes = []
+                for i in range(len(results[0].boxes)):
+                    if int(results[0].boxes.cls[i]) != cm.picture_id: continue
+                    x1,y1,x2,y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
+                    if ((x2-x1)*(y2-y1))/(img_w*img_h) < CHART_MIN_AREA: continue
+                    page_boxes.append([x1,y1,x2,y2,float(results[0].boxes.conf[i])])
+                if page_boxes: raw_boxes[pn] = page_boxes
+
+        raw_crops = []
+        for pn, boxes in raw_boxes.items():
+            img = page_images[pn-start]; img_w, img_h = img.size
+            for b in merge_boxes(boxes):
+                x1,y1,x2,y2,conf = b
+                crop = img.crop((max(0,x1-30),max(0,y1-30),min(img_w,x2+30),min(img_h,y2+30)))
+                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':round(conf,3)})
+        log.info(f'  YOLO: {len(raw_crops)} crops')
+
+        # GLM filter
+        chart_crops = {}
+        for c in raw_crops:
+            if cm.is_chart(c['crop']):
+                pn = c['page']
+                if pn not in chart_crops: chart_crops[pn] = []
+                img = page_images[pn-start]; img_w, img_h = img.size
+                x1,y1,x2,y2 = c['bbox']
+                big_crop = img.crop((max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)))
+                crop_path = charts_dir / f'page_{pn:04d}_chart_{len(chart_crops[pn])+1}.png'
+                big_crop.save(crop_path)
+                chart_crops[pn].append({'crop_path':str(crop_path),'bbox':[max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)],'conf':c['conf']})
+                log.info(f'  Pg {pn}: CHART')
+            else:
+                log.info(f'  Pg {c["page"]}: skip')
+
+        yolo_result['chart_crops'] = chart_crops
+        yolo_result['total_charts'] = sum(len(v) for v in chart_crops.values())
+        yolo_result['time'] = time.time() - t0
+        log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts in {yolo_result["time"]:.1f}s')
+
+    # Run both in parallel
+    t_parallel = time.time()
+    t1 = threading.Thread(target=run_sdk_ocr, name='Thread-sdk')
+    t2 = threading.Thread(target=run_yolo_pipeline, name='Thread-yolo')
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    log.info(f'Parallel phase: {time.time()-t_parallel:.1f}s')
+
+    sdk_pages = sdk_result['pages']
+    sdk_md = sdk_result['md']
+    page_images = yolo_result['page_images']
+    chart_crops = yolo_result['chart_crops']
+    total_charts = yolo_result['total_charts']
+    
     # ── Phase 4: Qwen chart descriptions (direct) ──
     t0 = time.time()
     for pn, charts in chart_crops.items():
