@@ -5,6 +5,8 @@ Production Pipeline v2 — GLM-OCR SDK (vLLM) + YOLO + Qwen Direct
 """
 
 import os, json, time, gc, logging, shutil,re,base64
+from io import BytesIO
+
 from pathlib import Path
 from datetime import datetime
 
