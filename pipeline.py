@@ -191,7 +191,10 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     t0 = time.time()
     sdk_output = output_dir / 'sdk_raw'; sdk_output.mkdir(exist_ok=True)
     result = parse(img_paths, config_path=GLMOCR_CONFIG, mode="selfhosted", enable_layout=False, ocr_api_host="localhost", ocr_api_port=8090, model="glm-ocr")
-    result.save(output_dir=str(sdk_output))
+    if isinstance(result, list):
+        for r in result: r.save(output_dir=str(sdk_output))
+    else:
+        result.save(output_dir=str(sdk_output))
 
     # Read SDK JSON output
     sdk_json = list(sdk_output.rglob('*.json'))
