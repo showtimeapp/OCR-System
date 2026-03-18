@@ -217,7 +217,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     for idx, img in enumerate(page_images):
         pn = start + idx
         img_w, img_h = img.size
-        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
+        results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cpu')
         if results and results[0].boxes is not None:
             page_boxes = []
             for i in range(len(results[0].boxes)):
