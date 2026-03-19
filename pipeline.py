@@ -232,93 +232,127 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
 
         # YOLO detection
         cm = ChartModels(); cm.load()
-        raw_boxes = {}
+        # Detect Pictures AND Tables separately
+        TABLE_ID = [k for k, v in cm.yolo.names.items() if v == 'Table'][0]
+        
+        raw_picture_boxes = {}
+        raw_table_boxes = {}
+        
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
             results = cm.yolo.predict(source=np.array(img), conf=0.25, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
-                page_detections = []
+                pic_boxes = []
+                tbl_boxes = []
                 for i in range(len(results[0].boxes)):
                     cls_id = int(results[0].boxes.cls[i])
-                    cls_name = cm.yolo.names.get(cls_id, '')
-                    if cls_name not in ('Picture', 'Table'): continue
                     x1,y1,x2,y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
-                    area_pct = ((x2-x1)*(y2-y1))/(img_w*img_h)
-                    if area_pct < CHART_MIN_AREA: continue
+                    if ((x2-x1)*(y2-y1))/(img_w*img_h) < CHART_MIN_AREA: continue
                     conf = float(results[0].boxes.conf[i])
-                    page_detections.append({'bbox':[x1,y1,x2,y2],'conf':conf,'cls_name':cls_name,'area_pct':area_pct})
-                if page_detections:
-                    raw_boxes[pn] = page_detections
+                    if cls_id == cm.picture_id:
+                        pic_boxes.append([x1,y1,x2,y2,conf])
+                    elif cls_id == TABLE_ID:
+                        tbl_boxes.append([x1,y1,x2,y2,conf])
+                if pic_boxes: raw_picture_boxes[pn] = pic_boxes
+                if tbl_boxes: raw_table_boxes[pn] = tbl_boxes
 
-        # Resolve overlapping Picture/Table detections — prefer Table
-        raw_crops = []
-        for pn, detections in raw_boxes.items():
-            img = page_images[pn-start]; img_w, img_h = img.size
-            
-            # Group overlapping detections
-            resolved = []
-            used = [False] * len(detections)
-            for i in range(len(detections)):
-                if used[i]: continue
-                best = detections[i]
-                for j in range(i+1, len(detections)):
-                    if used[j]: continue
-                    # Check overlap (IoU > 0.5)
-                    b1 = best['bbox']; b2 = detections[j]['bbox']
-                    ix1 = max(b1[0],b2[0]); iy1 = max(b1[1],b2[1])
-                    ix2 = min(b1[2],b2[2]); iy2 = min(b1[3],b2[3])
+        # Merge nearby boxes of same type
+        def merge_boxes_local(boxes, gap=80):
+            if len(boxes) <= 1: return boxes
+            merged = True
+            while merged:
+                merged = False
+                new_boxes, used = [], [False]*len(boxes)
+                for i in range(len(boxes)):
+                    if used[i]: continue
+                    x1,y1,x2,y2,conf = boxes[i]
+                    for j in range(i+1, len(boxes)):
+                        if used[j]: continue
+                        bx1,by1,bx2,by2,bconf = boxes[j]
+                        if not(bx1>x2+gap or bx2<x1-gap) and not(by1>y2+gap or by2<y1-gap):
+                            x1,y1=min(x1,bx1),min(y1,by1)
+                            x2,y2=max(x2,bx2),max(y2,by2)
+                            conf=max(conf,bconf); used[j]=True; merged=True
+                    new_boxes.append([x1,y1,x2,y2,conf]); used[i]=True
+                boxes = new_boxes
+            return boxes
+
+        # Resolve overlapping Picture/Table — prefer Table
+        def resolve_overlaps(pic_boxes, tbl_boxes):
+            """Remove Picture boxes that overlap with Table boxes"""
+            clean_pics = []
+            for pb in pic_boxes:
+                overlaps_table = False
+                for tb in tbl_boxes:
+                    ix1 = max(pb[0],tb[0]); iy1 = max(pb[1],tb[1])
+                    ix2 = min(pb[2],tb[2]); iy2 = min(pb[3],tb[3])
                     inter = max(0,ix2-ix1)*max(0,iy2-iy1)
-                    area1 = (b1[2]-b1[0])*(b1[3]-b1[1])
-                    area2 = (b2[2]-b2[0])*(b2[3]-b2[1])
-                    iou = inter/(area1+area2-inter) if (area1+area2-inter)>0 else 0
-                    if iou > 0.5:
-                        # Overlapping — prefer Table over Picture
-                        if detections[j]['cls_name'] == 'Table':
-                            best = detections[j]
-                        used[j] = True
-                resolved.append(best)
-                used[i] = True
-            
-            # Merge nearby boxes and create crops
-            for det in resolved:
-                x1,y1,x2,y2 = det['bbox']
-                crop = img.crop((max(0,x1-30),max(0,y1-30),min(img_w,x2+30),min(img_h,y2+30)))
-                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':det['conf'],'cls_name':det['cls_name']})
+                    area_pic = (pb[2]-pb[0])*(pb[3]-pb[1])
+                    if area_pic > 0 and inter/area_pic > 0.5:
+                        overlaps_table = True; break
+                if not overlaps_table:
+                    clean_pics.append(pb)
+            return clean_pics
 
-        log.info(f'  YOLO: {len(raw_crops)} crops')
-
-        # Separate tables and potential charts
+        # Build chart crops (merged Pictures, filtered by GLM)
         chart_crops = {}
-        table_crops = {}
-        
-        for c in raw_crops:
-            pn = c['page']
-            img = page_images[pn-start]; img_w, img_h = img.size
-            x1,y1,x2,y2 = c['bbox']
-            big_crop = img.crop((max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)))
+        for pn in set(list(raw_picture_boxes.keys()) + list(raw_table_boxes.keys())):
+            pic_boxes = raw_picture_boxes.get(pn, [])
+            tbl_boxes = raw_table_boxes.get(pn, [])
             
-            if c.get('cls_name') == 'Table':
+            # Merge each type separately
+            pic_merged = merge_boxes_local(pic_boxes, gap=80)
+            tbl_merged = merge_boxes_local(tbl_boxes, gap=80)
+            
+            # Remove pictures that overlap with tables
+            pic_final = resolve_overlaps(pic_merged, tbl_merged)
+            
+            # Filter pictures → charts
+            img = page_images[pn-start]; img_w, img_h = img.size
+            for b in pic_final:
+                x1,y1,x2,y2,conf = b
+                fx1,fy1 = max(0,x1-30), max(0,y1-30)
+                fx2,fy2 = min(img_w,x2+30), min(img_h,y2+30)
+                crop = img.crop((fx1,fy1,fx2,fy2))
+                if cm.is_chart(crop):
+                    if pn not in chart_crops: chart_crops[pn] = []
+                    bx1=max(0,x1-40);by1=max(0,y1-60)
+                    bx2=min(img_w,x2+40);by2=min(img_h,y2+80)
+                    big_crop = img.crop((bx1,by1,bx2,by2))
+                    crop_path = charts_dir / f'page_{pn:04d}_chart_{len(chart_crops[pn])+1}.png'
+                    big_crop.save(crop_path)
+                    chart_crops[pn].append({'crop_path':str(crop_path),'bbox':[bx1,by1,bx2,by2],'conf':round(conf,3)})
+                    log.info(f'  Pg {pn}: CHART')
+                else:
+                    log.info(f'  Pg {pn}: skip')
+
+        # Build table crops (merged Tables)
+        table_crops = {}
+        for pn, boxes in raw_table_boxes.items():
+            img = page_images[pn-start]; img_w, img_h = img.size
+            tbl_merged = merge_boxes_local(boxes, gap=80)
+            for b in tbl_merged:
+                x1,y1,x2,y2,conf = b
                 if pn not in table_crops: table_crops[pn] = []
+                bx1=max(0,x1-40);by1=max(0,y1-40)
+                bx2=min(img_w,x2+40);by2=min(img_h,y2+40)
+                big_crop = img.crop((bx1,by1,bx2,by2))
                 crop_path = charts_dir / f'page_{pn:04d}_table_{len(table_crops[pn])+1}.png'
                 big_crop.save(crop_path)
-                table_crops[pn].append({'crop_path':str(crop_path),'bbox':[max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)],'conf':c['conf']})
+                table_crops[pn].append({'crop_path':str(crop_path),'bbox':[bx1,by1,bx2,by2],'conf':round(conf,3)})
                 log.info(f'  Pg {pn}: TABLE')
-            elif cm.is_chart(c['crop']):
-                if pn not in chart_crops: chart_crops[pn] = []
-                crop_path = charts_dir / f'page_{pn:04d}_chart_{len(chart_crops[pn])+1}.png'
-                big_crop.save(crop_path)
-                chart_crops[pn].append({'crop_path':str(crop_path),'bbox':[max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)],'conf':c['conf']})
-                log.info(f'  Pg {pn}: CHART')
-            else:
-                log.info(f'  Pg {c["page"]}: skip')
+
+        total_charts = sum(len(v) for v in chart_crops.values())
+        total_tables = sum(len(v) for v in table_crops.values())
+        log.info(f'  Charts: {total_charts} | Tables: {total_tables}')
 
         yolo_result['chart_crops'] = chart_crops
         yolo_result['table_crops'] = table_crops
-        yolo_result['total_charts'] = sum(len(v) for v in chart_crops.values())
-        yolo_result['total_tables'] = sum(len(v) for v in table_crops.values())
+        yolo_result['total_charts'] = total_charts
+        yolo_result['total_tables'] = total_tables
         yolo_result['time'] = time.time() - t0
-        log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts, {yolo_result["total_tables"]} tables in {yolo_result["time"]:.1f}s')
-
+        log.info(f'Phase 0+2 done: {total_charts} charts, {total_tables} tables in {yolo_result["time"]:.1f}s')
+        
     # Run both in parallel
     t_parallel = time.time()
     t1 = threading.Thread(target=run_sdk_ocr, name='Thread-sdk')
