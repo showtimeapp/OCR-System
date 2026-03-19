@@ -110,7 +110,7 @@ class ChartModels:
         return 'yes' in result.strip().lower()
 
     # ── Qwen chart description (direct) ──
-    def describe_chart(self, image, max_tokens=600):
+    def describe_chart(self, image, max_tokens=900):
         if max(image.size) < QWEN_UPSCALE:
             s = QWEN_UPSCALE / max(image.size)
             image = image.resize((int(image.width*s), int(image.height*s)), Image.LANCZOS)
@@ -284,7 +284,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         table_crops = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.25, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.15, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 tbl_boxes = []
                 for i in range(len(results[0].boxes)):
