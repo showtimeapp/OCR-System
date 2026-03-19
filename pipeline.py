@@ -132,8 +132,7 @@ class ChartModels:
                 {"type":"text","text":TABLE_PROMPT}
             ]}], "max_tokens": max_tokens, "temperature": 0,
         }, timeout=60)
-        result = resp.json()['choices'][0]['message']['content'].strip()
-        return html_table_to_markdown(result)
+        return resp.json()['choices'][0]['message']['content'].strip()
 # ═══════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════
@@ -159,27 +158,6 @@ def merge_boxes(boxes, gap=MERGE_GAP):
         boxes = new_boxes
     return boxes
 
-def html_table_to_markdown(html_str):
-    """Convert HTML table to markdown table"""
-    if '<table' not in html_str.lower():
-        return html_str
-    try:
-        import re
-        # Extract rows
-        rows = re.findall(r'<tr>(.*?)</tr>', html_str, re.DOTALL)
-        md_rows = []
-        for row in rows:
-            cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL)
-            cells = [c.strip().replace('&amp;', '&').replace('&#x27;', "'").replace('&quot;', '"') for c in cells]
-            md_rows.append('| ' + ' | '.join(cells) + ' |')
-        if len(md_rows) >= 1:
-            # Add separator after first row (header)
-            header_cols = md_rows[0].count('|') - 1
-            separator = '| ' + ' | '.join(['---'] * header_cols) + ' |'
-            md_rows.insert(1, separator)
-        return '\n'.join(md_rows)
-    except:
-        return html_str
 # ═══════════════════════════════════════════════════
 #  MAIN PIPELINE
 # ═══════════════════════════════════════════════════
@@ -424,7 +402,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                     'page_size': [page_w, page_h]
                 })
 
-            # Add chart blocks with coordinates
+            # Add chart blocks
             if pn in chart_crops:
                 for ci, ch in enumerate(chart_crops[pn]):
                     blocks.append({
@@ -438,12 +416,23 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                         'page': pn,
                         'page_size': [page_w, page_h]
                     })
+
+            # Add table blocks
             if pn in table_crops:
-                page['tables'] = [{'page':pn,'bbox':tb['bbox'],'conf':tb['conf'],
-                    'crop_path':tb.get('crop_path',''),
-                    'markdown':tb.get('markdown','')} for tb in table_crops[pn]]
-                
-            # Full page text for backward compatibility
+                for ti, tb in enumerate(table_crops[pn]):
+                    blocks.append({
+                        'type': 'table',
+                        'index': ti,
+                        'label': 'table',
+                        'content': tb.get('markdown', ''),
+                        'bbox': tb['bbox'],
+                        'conf': tb['conf'],
+                        'crop_path': tb.get('crop_path', ''),
+                        'page': pn,
+                        'page_size': [page_w, page_h]
+                    })
+
+            # Full page text
             full_text = '\n\n'.join([b['content'] for b in blocks if b['type'] == 'text'])
 
             page = {
@@ -451,8 +440,20 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                 'page_size': [page_w, page_h],
                 'ocr_text': full_text,
                 'has_chart': pn in chart_crops,
+                'has_table': pn in table_crops,
                 'blocks': blocks
             }
+
+            if pn in chart_crops:
+                page['charts'] = [{'page':pn,'bbox':ch['bbox'],'conf':ch['conf'],
+                    'crop_path':ch.get('crop_path',''),
+                    'description':ch.get('description','')} for ch in chart_crops[pn]]
+
+            if pn in table_crops:
+                page['tables'] = [{'page':pn,'bbox':tb['bbox'],'conf':tb['conf'],
+                    'crop_path':tb.get('crop_path',''),
+                    'markdown':tb.get('markdown','')} for tb in table_crops[pn]]
+
             all_pages.append(page)
 
     # Save JSON
