@@ -33,19 +33,16 @@ MERGE_GAP = int(os.getenv("MERGE_GAP", "80"))
 QWEN_UPSCALE = int(os.getenv("QWEN_UPSCALE", "800"))
 GLMOCR_CONFIG = os.getenv("GLMOCR_CONFIG", os.path.expanduser("~/pipeline/config.yaml"))
 
-CHART_PROMPT = """Read every number carefully. Commas are thousand separators (11,323 = eleven thousand 323, NOT 11.23).
-1. Chart title and type
-2. EVERY bar/line/slice with EXACT label and number
-3. EVERY percentage, growth rate, YoY change
-4. Time periods
-5. Multiple series/colors with values
-6. Overall trend
-Write as flowing sentences. Reader should know every data point without seeing the chart."""
+CHART_PROMPT = """You are analyzing a financial chart. Read every number carefully. Commas are thousand separators (11,323 = eleven thousand three hundred twenty three, NOT 11.23).
+
+Describe this chart completely in flowing paragraph format. Include: the chart title and type, every single bar/line/slice with its exact label and numerical value, all percentages and YoY growth rates, the time periods covered, any multiple series or color-coded categories with their individual values, and the overall trend. 
+
+Write ONLY in complete flowing sentences — no bullet points, no numbered lists, no headings. The reader should know every single data point without seeing the chart."""
 
 # FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 
-TABLE_PROMPT = "Parse this table precisely. Output as a markdown table with | separators. Keep ALL numbers exactly as shown including commas. Include all headers and every row. Do not skip any data."
+TABLE_PROMPT = "Parse this table precisely. Output as a markdown table with | separators. Keep ALL numbers exactly as shown including commas. Include all headers and every row. Do not skip any data.only markdown no html"
 # ═══════════════════════════════════════════════════
 #  MODELS — Qwen + YOLO (loaded once)
 # ═══════════════════════════════════════════════════
@@ -125,7 +122,7 @@ class ChartModels:
         }, timeout=120)
         return resp.json()['choices'][0]['message']['content'].strip()
 
-    def describe_table(self, image, max_tokens=1024):
+    def describe_table(self, image, max_tokens=2048):
         buf = BytesIO(); image.save(buf, format='PNG')
         b64 = base64.b64encode(buf.getvalue()).decode()
         resp = req.post(self.glm_url, json={
@@ -236,7 +233,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         raw_boxes = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.35, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 page_boxes = []
                 for i in range(len(results[0].boxes)):
@@ -284,7 +281,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         table_crops = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.15, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.12, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 tbl_boxes = []
                 for i in range(len(results[0].boxes)):
@@ -364,7 +361,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             t1 = time.time()
             crop = Image.open(ch['crop_path'])
             area = crop.width * crop.height
-            max_tok = 900 if area > 500000 else 600 if area > 250000 else 400
+            max_tok = 1200 if area > 500000 else 800 if area > 250000 else 500
             desc = cm.describe_chart(crop, max_tok)
             ch['description'] = desc
             log.info(f'  [Qwen] Pg {pn} chart {i+1}: {len(desc)} chars [{time.time()-t1:.1f}s]')
