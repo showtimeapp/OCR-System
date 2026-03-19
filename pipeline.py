@@ -128,8 +128,8 @@ class ChartModels:
     def describe_table(self, image, max_tokens=1024):
         buf = BytesIO(); image.save(buf, format='PNG')
         b64 = base64.b64encode(buf.getvalue()).decode()
-        resp = req.post(GLM_OCR_URL, json={
-            "model": GLM_MODEL_NAME,
+        resp = req.post(self.glm_url, json={
+            "model": self.glm_model,
             "messages": [{"role":"user","content":[
                 {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
                 {"type":"text","text":TABLE_PROMPT}
@@ -318,7 +318,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         yolo_result['total_tables'] = sum(len(v) for v in table_crops.values())
         yolo_result['time'] = time.time() - t0
         log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts, {yolo_result["total_tables"]} tables in {yolo_result["time"]:.1f}s')
-        
+
     # Run both in parallel
     t_parallel = time.time()
     t1 = threading.Thread(target=run_sdk_ocr, name='Thread-sdk')
