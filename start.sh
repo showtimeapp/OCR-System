@@ -1,32 +1,48 @@
-"""Test client — send PDF, download results"""
-import requests, sys, time
+#!/bin/bash
+export LD_LIBRARY_PATH=$HOME/miniconda3/envs/ocr/lib:$LD_LIBRARY_PATH
+mkdir -p logs uploads results charts
 
-API = "http://34.100.176.183"
+echo "═══ Starting Pipeline ═══"
 
-def extract(pdf_path):
-    print(f'Uploading {pdf_path}...')
-    with open(pdf_path, 'rb') as f:
-        t0 = time.time()
-        resp = requests.post(f'{API}/extract', files={'file': (pdf_path.split('/')[-1], f)}, timeout=3600)
-        dt = time.time() - t0
+pkill -f "vllm serve" 2>/dev/null
+sudo pkill -f api.py 2>/dev/null
+sleep 3
 
-    if resp.status_code != 200:
-        print(f'Error: {resp.text}')
-        return
+echo "Starting GLM-OCR vLLM (port 8090)..."
+FLASHINFER_DISABLE_VERSION_CHECK=1 vllm serve zai-org/GLM-OCR \
+  --port 8090 --dtype float16 --gpu-memory-utilization 0.25 --max-model-len 8192 \
+  --served-model-name glm-ocr --allowed-local-media-path / > logs/glm_vllm.log 2>&1 &
 
-    data = resp.json()
-    print(f'\nDone in {dt:.1f}s!')
-    print(f'  Pages: {data["pages_processed"]}')
-    print(f'  Charts: {data["charts_found"]}')
-    print(f'  Speed: {data["avg_sec_per_page"]}s/page')
+echo "Starting Qwen vLLM (port 8091)..."
+FLASHINFER_DISABLE_VERSION_CHECK=1 vllm serve cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit \
+  --port 8091 --dtype float16 --gpu-memory-utilization 0.45 --max-model-len 4096 \
+  --served-model-name qwen-vl > logs/qwen_vllm.log 2>&1 &
 
-    for ep, fn in [(data['download_json'], 'extraction.json'), (data['download_md'], 'full.md')]:
-        r = requests.get(f'{API}{ep}')
-        with open(fn, 'wb') as f: f.write(r.content)
-        print(f'  Saved: {fn}')
+echo "Waiting for vLLM servers (~2 min)..."
+for i in $(seq 1 90); do
+  G=$(curl -s http://localhost:8090/health 2>/dev/null)
+  Q=$(curl -s http://localhost:8091/health 2>/dev/null)
+  if [ -n "$G" ] && [ -n "$Q" ]; then
+    echo "  ✓ Both vLLM servers ready!"
+    break
+  fi
+  sleep 2
+done
 
-if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('Usage: python test_client.py <pdf_path>')
-    else:
-        extract(sys.argv[1])
+echo "Starting API on port 80..."
+sudo LD_LIBRARY_PATH=$LD_LIBRARY_PATH $(which python3) api.py &
+sleep 15
+
+if curl -s http://localhost:80/health > /dev/null 2>&1; then
+  EXT_IP=$(curl -s ifconfig.me 2>/dev/null || echo "UNKNOWN")
+  echo ""
+  echo "═══════════════════════════════════════"
+  echo "  ✓ Pipeline running!"
+  echo "  API:  http://$EXT_IP/docs"
+  echo "  GLM:  http://localhost:8090"
+  echo "  Qwen: http://localhost:8091"
+  echo "═══════════════════════════════════════"
+else
+  echo "  ✗ API failed. Check logs/api.log"
+  tail -10 logs/api.log
+fi
