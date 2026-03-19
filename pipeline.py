@@ -281,7 +281,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         table_crops = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.15, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.1, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 tbl_boxes = []
                 for i in range(len(results[0].boxes)):
@@ -292,7 +292,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                     tbl_boxes.append([x1,y1,x2,y2,conf])
                 if tbl_boxes:
                     # Merge nearby tables
-                    tbl_merged = merge_boxes(tbl_boxes, gap=150)
+                    tbl_merged = merge_boxes(tbl_boxes, gap=180)
                     # Skip tables that overlap with detected charts on same page
                     for b in tbl_merged:
                         x1,y1,x2,y2,conf = b
