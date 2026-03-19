@@ -43,7 +43,7 @@ CHART_PROMPT = """Read every number carefully. Commas are thousand separators (1
 Write as flowing sentences. Reader should know every data point without seeing the chart."""
 
 # FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
-FILTER_PROMPT = "Does this image contain a BAR CHART, LINE GRAPH, PIE CHART, or AREA CHART with numerical AXES (X-axis and Y-axis with numbers), data bars/lines/slices, and specific data values? It must have measurable axes with numbers. An infographic, mind map, illustration, icon grid, table of contents, or product showcase is NOT a chart. Answer only YES or NO."
+FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 
 TABLE_PROMPT = "Parse this table precisely. Output as a markdown table with | separators. Keep ALL numbers exactly as shown including commas. Include all headers and every row. Do not skip any data."
 # ═══════════════════════════════════════════════════
