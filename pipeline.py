@@ -292,7 +292,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                     tbl_boxes.append([x1,y1,x2,y2,conf])
                 if tbl_boxes:
                     # Merge nearby tables
-                    tbl_merged = merge_boxes(tbl_boxes, gap=100)
+                    tbl_merged = merge_boxes(tbl_boxes, gap=150)
                     # Skip tables that overlap with detected charts on same page
                     for b in tbl_merged:
                         x1,y1,x2,y2,conf = b
