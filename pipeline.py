@@ -36,8 +36,8 @@ GLMOCR_CONFIG = os.getenv("GLMOCR_CONFIG", os.path.expanduser("~/pipeline/config
 CHART_PROMPT = """You are analyzing a financial chart. Read every number carefully. Commas are thousand separators (11,323 = eleven thousand three hundred twenty three, NOT 11.23).
 
 Describe this chart completely in flowing paragraph format. Include: the chart title and type, every single bar/line/slice with its exact label and numerical value, all percentages and YoY growth rates, the time periods covered, any multiple series or color-coded categories with their individual values, and the overall trend. 
-
-Write ONLY in complete flowing sentences — no bullet points, no numbered lists, no headings. The reader should know every single data point without seeing the chart."""
+if it is not Chart simple write "No" in the respose and nothing else.
+Write ONLY in complete flowing sentences and concise (limited words). The reader should know every single data point without seeing the chart."""
 
 # FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
@@ -233,7 +233,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         raw_boxes = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.35, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 page_boxes = []
                 for i in range(len(results[0].boxes)):
@@ -281,7 +281,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         table_crops = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.12, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.15, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
                 tbl_boxes = []
                 for i in range(len(results[0].boxes)):
@@ -292,7 +292,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                     tbl_boxes.append([x1,y1,x2,y2,conf])
                 if tbl_boxes:
                     # Merge nearby tables
-                    tbl_merged = merge_boxes(tbl_boxes, gap=80)
+                    tbl_merged = merge_boxes(tbl_boxes, gap=100)
                     # Skip tables that overlap with detected charts on same page
                     for b in tbl_merged:
                         x1,y1,x2,y2,conf = b
