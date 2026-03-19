@@ -42,7 +42,8 @@ CHART_PROMPT = """Read every number carefully. Commas are thousand separators (1
 6. Overall trend
 Write as flowing sentences. Reader should know every data point without seeing the chart."""
 
-FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
+# FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
+FILTER_PROMPT = "Does this image contain a BAR CHART, LINE GRAPH, PIE CHART, or AREA CHART with numerical AXES (X-axis and Y-axis with numbers), data bars/lines/slices, and specific data values? It must have measurable axes with numbers. An infographic, mind map, illustration, icon grid, table of contents, or product showcase is NOT a chart. Answer only YES or NO."
 
 TABLE_PROMPT = "Parse this table precisely. Output as a markdown table with | separators. Keep ALL numbers exactly as shown including commas. Include all headers and every row. Do not skip any data."
 # ═══════════════════════════════════════════════════
@@ -234,28 +235,59 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         raw_boxes = {}
         for idx, img in enumerate(page_images):
             pn = start + idx; img_w, img_h = img.size
-            results = cm.yolo.predict(source=np.array(img), conf=0.3, verbose=False, imgsz=640, device='cuda:0')
+            results = cm.yolo.predict(source=np.array(img), conf=0.25, verbose=False, imgsz=640, device='cuda:0')
             if results and results[0].boxes is not None:
-                page_boxes = []
+                page_detections = []
                 for i in range(len(results[0].boxes)):
                     cls_id = int(results[0].boxes.cls[i])
                     cls_name = cm.yolo.names.get(cls_id, '')
                     if cls_name not in ('Picture', 'Table'): continue
                     x1,y1,x2,y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
-                    if ((x2-x1)*(y2-y1))/(img_w*img_h) < CHART_MIN_AREA: continue
-                    page_boxes.append([x1,y1,x2,y2,float(results[0].boxes.conf[i])])
-                if page_boxes: raw_boxes[pn] = page_boxes
+                    area_pct = ((x2-x1)*(y2-y1))/(img_w*img_h)
+                    if area_pct < CHART_MIN_AREA: continue
+                    conf = float(results[0].boxes.conf[i])
+                    page_detections.append({'bbox':[x1,y1,x2,y2],'conf':conf,'cls_name':cls_name,'area_pct':area_pct})
+                if page_detections:
+                    raw_boxes[pn] = page_detections
 
+        # Resolve overlapping Picture/Table detections — prefer Table
         raw_crops = []
-        for pn, boxes in raw_boxes.items():
+        for pn, detections in raw_boxes.items():
             img = page_images[pn-start]; img_w, img_h = img.size
-            for b in merge_boxes(boxes):
-                x1,y1,x2,y2,conf = b
+            
+            # Group overlapping detections
+            resolved = []
+            used = [False] * len(detections)
+            for i in range(len(detections)):
+                if used[i]: continue
+                best = detections[i]
+                for j in range(i+1, len(detections)):
+                    if used[j]: continue
+                    # Check overlap (IoU > 0.5)
+                    b1 = best['bbox']; b2 = detections[j]['bbox']
+                    ix1 = max(b1[0],b2[0]); iy1 = max(b1[1],b2[1])
+                    ix2 = min(b1[2],b2[2]); iy2 = min(b1[3],b2[3])
+                    inter = max(0,ix2-ix1)*max(0,iy2-iy1)
+                    area1 = (b1[2]-b1[0])*(b1[3]-b1[1])
+                    area2 = (b2[2]-b2[0])*(b2[3]-b2[1])
+                    iou = inter/(area1+area2-inter) if (area1+area2-inter)>0 else 0
+                    if iou > 0.5:
+                        # Overlapping — prefer Table over Picture
+                        if detections[j]['cls_name'] == 'Table':
+                            best = detections[j]
+                        used[j] = True
+                resolved.append(best)
+                used[i] = True
+            
+            # Merge nearby boxes and create crops
+            for det in resolved:
+                x1,y1,x2,y2 = det['bbox']
                 crop = img.crop((max(0,x1-30),max(0,y1-30),min(img_w,x2+30),min(img_h,y2+30)))
-                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':round(conf,3),'cls_name':cls_name})
+                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':det['conf'],'cls_name':det['cls_name']})
+
         log.info(f'  YOLO: {len(raw_crops)} crops')
 
-        # GLM filter
+        # Separate tables and potential charts
         chart_crops = {}
         table_crops = {}
         
@@ -264,7 +296,6 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             img = page_images[pn-start]; img_w, img_h = img.size
             x1,y1,x2,y2 = c['bbox']
             big_crop = img.crop((max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)))
-            crop_path_prefix = charts_dir / f'page_{pn:04d}'
             
             if c.get('cls_name') == 'Table':
                 if pn not in table_crops: table_crops[pn] = []
@@ -287,7 +318,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
         yolo_result['total_tables'] = sum(len(v) for v in table_crops.values())
         yolo_result['time'] = time.time() - t0
         log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts, {yolo_result["total_tables"]} tables in {yolo_result["time"]:.1f}s')
-
+        
     # Run both in parallel
     t_parallel = time.time()
     t1 = threading.Thread(target=run_sdk_ocr, name='Thread-sdk')
@@ -433,7 +464,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                 if md:
                     table_text += f'\n\n📋 **[Table]**:\n{md}\n'
             sdk_sections[page_idx] = sdk_sections[page_idx] + table_text
-            
+
     final_md = '\n---\n'.join(sdk_sections)
     md_path = output_dir / 'full.md'
     with open(md_path, 'w', encoding='utf-8') as f:
