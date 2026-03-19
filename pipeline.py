@@ -44,7 +44,7 @@ Write as flowing sentences. Reader should know every data point without seeing t
 
 FILTER_PROMPT = "Is this a bar chart, line graph, pie chart, or area chart with axes and data points? Not a table, not a photo, not an icon, not an infographic. Answer only YES or NO."
 
-
+TABLE_PROMPT = "Parse this table precisely. Output as a markdown table with | separators. Keep ALL numbers exactly as shown including commas. Include all headers and every row. Do not skip any data."
 # ═══════════════════════════════════════════════════
 #  MODELS — Qwen + YOLO (loaded once)
 # ═══════════════════════════════════════════════════
@@ -124,6 +124,17 @@ class ChartModels:
         }, timeout=120)
         return resp.json()['choices'][0]['message']['content'].strip()
 
+    def describe_table(self, image, max_tokens=1024):
+        buf = BytesIO(); image.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        resp = req.post(GLM_OCR_URL, json={
+            "model": GLM_MODEL_NAME,
+            "messages": [{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}},
+                {"type":"text","text":TABLE_PROMPT}
+            ]}], "max_tokens": max_tokens, "temperature": 0,
+        }, timeout=60)
+        return resp.json()['choices'][0]['message']['content'].strip()
 # ═══════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════
@@ -227,7 +238,9 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             if results and results[0].boxes is not None:
                 page_boxes = []
                 for i in range(len(results[0].boxes)):
-                    if int(results[0].boxes.cls[i]) != cm.picture_id: continue
+                    cls_id = int(results[0].boxes.cls[i])
+                    cls_name = cm.yolo.names.get(cls_id, '')
+                    if cls_name not in ('Picture', 'Table'): continue
                     x1,y1,x2,y2 = map(int, results[0].boxes.xyxy[i].cpu().numpy())
                     if ((x2-x1)*(y2-y1))/(img_w*img_h) < CHART_MIN_AREA: continue
                     page_boxes.append([x1,y1,x2,y2,float(results[0].boxes.conf[i])])
@@ -239,18 +252,28 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             for b in merge_boxes(boxes):
                 x1,y1,x2,y2,conf = b
                 crop = img.crop((max(0,x1-30),max(0,y1-30),min(img_w,x2+30),min(img_h,y2+30)))
-                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':round(conf,3)})
+                raw_crops.append({'page':pn,'crop':crop,'bbox':[x1,y1,x2,y2],'conf':round(conf,3),'cls_name':cls_name})
         log.info(f'  YOLO: {len(raw_crops)} crops')
 
         # GLM filter
         chart_crops = {}
+        table_crops = {}
+        
         for c in raw_crops:
-            if cm.is_chart(c['crop']):
-                pn = c['page']
+            pn = c['page']
+            img = page_images[pn-start]; img_w, img_h = img.size
+            x1,y1,x2,y2 = c['bbox']
+            big_crop = img.crop((max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)))
+            crop_path_prefix = charts_dir / f'page_{pn:04d}'
+            
+            if c.get('cls_name') == 'Table':
+                if pn not in table_crops: table_crops[pn] = []
+                crop_path = charts_dir / f'page_{pn:04d}_table_{len(table_crops[pn])+1}.png'
+                big_crop.save(crop_path)
+                table_crops[pn].append({'crop_path':str(crop_path),'bbox':[max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)],'conf':c['conf']})
+                log.info(f'  Pg {pn}: TABLE')
+            elif cm.is_chart(c['crop']):
                 if pn not in chart_crops: chart_crops[pn] = []
-                img = page_images[pn-start]; img_w, img_h = img.size
-                x1,y1,x2,y2 = c['bbox']
-                big_crop = img.crop((max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)))
                 crop_path = charts_dir / f'page_{pn:04d}_chart_{len(chart_crops[pn])+1}.png'
                 big_crop.save(crop_path)
                 chart_crops[pn].append({'crop_path':str(crop_path),'bbox':[max(0,x1-40),max(0,y1-60),min(img_w,x2+40),min(img_h,y2+80)],'conf':c['conf']})
@@ -259,9 +282,11 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                 log.info(f'  Pg {c["page"]}: skip')
 
         yolo_result['chart_crops'] = chart_crops
+        yolo_result['table_crops'] = table_crops
         yolo_result['total_charts'] = sum(len(v) for v in chart_crops.values())
+        yolo_result['total_tables'] = sum(len(v) for v in table_crops.values())
         yolo_result['time'] = time.time() - t0
-        log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts in {yolo_result["time"]:.1f}s')
+        log.info(f'Phase 0+2 done: {yolo_result["total_charts"]} charts, {yolo_result["total_tables"]} tables in {yolo_result["time"]:.1f}s')
 
     # Run both in parallel
     t_parallel = time.time()
@@ -277,6 +302,18 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     page_images = yolo_result['page_images']
     chart_crops = yolo_result['chart_crops']
     total_charts = yolo_result['total_charts']
+    table_crops = yolo_result.get('table_crops', {})
+    total_tables = yolo_result.get('total_tables', 0)
+
+    # ── Phase 3.5: Table OCR via GLM-OCR vLLM ──
+    t0 = time.time()
+    for pn, tables in table_crops.items():
+        for i, tb in enumerate(tables):
+            t1 = time.time()
+            crop = Image.open(tb['crop_path'])
+            tb['markdown'] = cm.describe_table(crop)
+            log.info(f'  [Table] Pg {pn} table {i+1}: {len(tb["markdown"])} chars [{time.time()-t1:.1f}s]')
+    log.info(f'Phase 3.5 (Tables): {total_tables} tables in {time.time()-t0:.1f}s')
 
     # ── Phase 4: Qwen chart descriptions (direct) ──
     t0 = time.time()
@@ -341,7 +378,11 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                         'page': pn,
                         'page_size': [page_w, page_h]
                     })
-
+            if pn in table_crops:
+                page['tables'] = [{'bbox':tb['bbox'],'conf':tb['conf'],
+                    'crop_path':tb.get('crop_path',''),
+                    'markdown':tb.get('markdown','')} for tb in table_crops[pn]]
+                
             # Full page text for backward compatibility
             full_text = '\n\n'.join([b['content'] for b in blocks if b['type'] == 'text'])
 
@@ -383,6 +424,16 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                     chart_text += f'\n\n📊 **[Chart Description]**: {desc}\n'
             sdk_sections[page_idx] = sdk_sections[page_idx] + chart_text
     
+    for pn, tables in table_crops.items():
+        page_idx = pn - start
+        if page_idx < len(sdk_sections):
+            table_text = ''
+            for tb in tables:
+                md = tb.get('markdown', '')
+                if md:
+                    table_text += f'\n\n📋 **[Table]**:\n{md}\n'
+            sdk_sections[page_idx] = sdk_sections[page_idx] + table_text
+            
     final_md = '\n---\n'.join(sdk_sections)
     md_path = output_dir / 'full.md'
     with open(md_path, 'w', encoding='utf-8') as f:

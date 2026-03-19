@@ -7,7 +7,7 @@ pipeline:
     model: glm-ocr
   enable_layout: false
   page_loader:
-    max_tokens: 2048
+    max_tokens: 4096
     temperature: 0.01
   result_formatter:
     output_format: both
