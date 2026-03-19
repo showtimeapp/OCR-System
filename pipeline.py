@@ -132,7 +132,8 @@ class ChartModels:
                 {"type":"text","text":TABLE_PROMPT}
             ]}], "max_tokens": max_tokens, "temperature": 0,
         }, timeout=60)
-        return resp.json()['choices'][0]['message']['content'].strip()
+        result = resp.json()['choices'][0]['message']['content'].strip()
+        return html_table_to_markdown(result)
 # ═══════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════
@@ -158,7 +159,27 @@ def merge_boxes(boxes, gap=MERGE_GAP):
         boxes = new_boxes
     return boxes
 
-
+def html_table_to_markdown(html_str):
+    """Convert HTML table to markdown table"""
+    if '<table' not in html_str.lower():
+        return html_str
+    try:
+        import re
+        # Extract rows
+        rows = re.findall(r'<tr>(.*?)</tr>', html_str, re.DOTALL)
+        md_rows = []
+        for row in rows:
+            cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL)
+            cells = [c.strip().replace('&amp;', '&').replace('&#x27;', "'").replace('&quot;', '"') for c in cells]
+            md_rows.append('| ' + ' | '.join(cells) + ' |')
+        if len(md_rows) >= 1:
+            # Add separator after first row (header)
+            header_cols = md_rows[0].count('|') - 1
+            separator = '| ' + ' | '.join(['---'] * header_cols) + ' |'
+            md_rows.insert(1, separator)
+        return '\n'.join(md_rows)
+    except:
+        return html_str
 # ═══════════════════════════════════════════════════
 #  MAIN PIPELINE
 # ═══════════════════════════════════════════════════
@@ -418,7 +439,7 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
                         'page_size': [page_w, page_h]
                     })
             if pn in table_crops:
-                page['tables'] = [{'bbox':tb['bbox'],'conf':tb['conf'],
+                page['tables'] = [{'page':pn,'bbox':tb['bbox'],'conf':tb['conf'],
                     'crop_path':tb.get('crop_path',''),
                     'markdown':tb.get('markdown','')} for tb in table_crops[pn]]
                 
@@ -452,17 +473,22 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
     # Split SDK markdown into pages (separated by ---)
     sdk_sections = re.split(r'\n---\n', sdk_md) if sdk_md else []
     
+    # Add page headers
+    for i in range(len(sdk_sections)):
+        pn = start + i
+        sdk_sections[i] = f'\n## Page {pn}\n' + sdk_sections[i]
+    
     # Insert chart descriptions into correct page sections
     for pn, charts in chart_crops.items():
-        page_idx = pn - start  # 0-indexed
+        page_idx = pn - start
         if page_idx < len(sdk_sections):
             chart_text = ''
             for ch in charts:
                 desc = ch.get('description', '')
                 if desc:
-                    chart_text += f'\n\n📊 **[Chart Description]**: {desc}\n'
+                    chart_text += f'\n\n📊 **[Chart — Page {pn}]**: {desc}\n'
             sdk_sections[page_idx] = sdk_sections[page_idx] + chart_text
-    
+
     for pn, tables in table_crops.items():
         page_idx = pn - start
         if page_idx < len(sdk_sections):
@@ -470,9 +496,9 @@ def process_pdf(pdf_path, output_dir=None, start=1, end=None):
             for tb in tables:
                 md = tb.get('markdown', '')
                 if md:
-                    table_text += f'\n\n📋 **[Table]**:\n{md}\n'
+                    table_text += f'\n\n📋 **[Table — Page {pn}]**:\n{md}\n'
             sdk_sections[page_idx] = sdk_sections[page_idx] + table_text
-
+    
     final_md = '\n---\n'.join(sdk_sections)
     md_path = output_dir / 'full.md'
     with open(md_path, 'w', encoding='utf-8') as f:
